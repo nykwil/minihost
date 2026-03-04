@@ -41,6 +41,8 @@ public:
 
     void initialise (const juce::String& commandLine) override
     {
+        juce::ignoreUnused(commandLine);
+
         // Set up a simple file logger on the Desktop
         juce::File logFile = juce::File::getSpecialLocation(juce::File::userDesktopDirectory).getChildFile("minihost.log");
         if (logFile.exists()) logFile.deleteFile();
@@ -52,20 +54,72 @@ public:
         auto args = juce::JUCEApplication::getCommandLineParameterArray();
         if (args.isEmpty())
         {
-            juce::Logger::writeToLog("Error: No plugin path provided. Usage: minihost [--test] <path_to_vst3>");
+            juce::Logger::writeToLog("Error: No plugin path provided. Usage: minihost [--test] [--config <path_to_json>] [--bpm <value>] <path_to_vst3>");
             juce::JUCEApplication::quit();
             return;
         }
 
         bool runTestingMode = false;
         juce::String pluginPath;
+        juce::String configPath;
+        double bpmOverride = 0.0;
 
-        for (const auto& arg : args)
+        for (int i = 0; i < args.size(); ++i)
         {
+            const auto& arg = args[i];
+
             if (arg == "--test")
+            {
                 runTestingMode = true;
+            }
+            else if (arg == "--config")
+            {
+                if (i + 1 < args.size())
+                    configPath = args[++i];
+                else
+                {
+                    juce::Logger::writeToLog("Error: --config requires a path argument.");
+                    juce::JUCEApplication::quit();
+                    return;
+                }
+            }
+            else if (arg.startsWith("--config="))
+            {
+                configPath = arg.fromFirstOccurrenceOf("=", false, false);
+            }
+            else if (arg == "--bpm")
+            {
+                if (i + 1 < args.size())
+                {
+                    bpmOverride = args[++i].getDoubleValue();
+                    if (bpmOverride <= 0.0)
+                    {
+                        juce::Logger::writeToLog("Error: --bpm requires a numeric value > 0.");
+                        juce::JUCEApplication::quit();
+                        return;
+                    }
+                }
+                else
+                {
+                    juce::Logger::writeToLog("Error: --bpm requires a value.");
+                    juce::JUCEApplication::quit();
+                    return;
+                }
+            }
+            else if (arg.startsWith("--bpm="))
+            {
+                bpmOverride = arg.fromFirstOccurrenceOf("=", false, false).getDoubleValue();
+                if (bpmOverride <= 0.0)
+                {
+                    juce::Logger::writeToLog("Error: --bpm requires a numeric value > 0.");
+                    juce::JUCEApplication::quit();
+                    return;
+                }
+            }
             else
+            {
                 pluginPath = arg; // We'll assume the last non-flag argument is the path
+            }
         }
         
         if (pluginPath.isEmpty())
@@ -76,11 +130,15 @@ public:
         }
 
         juce::Logger::writeToLog("Plugin path parsed: " + pluginPath);
+        if (configPath.isNotEmpty())
+            juce::Logger::writeToLog("Config path parsed: " + configPath);
+        if (bpmOverride > 0.0)
+            juce::Logger::writeToLog("BPM override parsed: " + juce::String(bpmOverride, 2));
 
         hostApp = std::make_unique<HostApp>();
         juce::Logger::writeToLog("HostApp created. Abstracting audio/midi devices...");
         
-        if (!hostApp->initialise(pluginPath))
+        if (!hostApp->initialise(pluginPath, configPath, bpmOverride))
         {
             juce::Logger::writeToLog("Failed to initialize HostApp with plugin: " + pluginPath);
             juce::JUCEApplication::quit();
