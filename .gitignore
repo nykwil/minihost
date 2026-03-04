@@ -1,0 +1,29 @@
+# Build directories
+/build/
+/build_vs/
+
+# CMake artifacts
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+CTestTestfile.cmake
+
+# Build outputs
+*.obj
+*.o
+*.pdb
+*.ilk
+*.lib
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# IDE/editor
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
