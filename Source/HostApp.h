@@ -8,7 +8,9 @@ public:
     HostApp();
     ~HostApp() override;
 
-    bool initialise(const juce::String& pluginPath);
+    bool initialise(const juce::String& pluginPath,
+                    const juce::String& configPath = {},
+                    double bpmOverride = 0.0);
     void shutdown();
     
     // AudioIODeviceCallback methods
@@ -28,12 +30,14 @@ public:
     juce::AudioPluginInstance* getPluginInstance() const { return pluginInstance.get(); }
 
 private:
-    void parseConfig();
+    void parseConfig(const juce::String& configPath);
+    void applyBpmToMidiSequence(double bpm);
     void generateInternalTestSequence(double sampleRate);
     
     bool shouldLoop = false;
     juce::String audioFilePath;
     juce::String midiFilePath;
+    double configuredBpm = 120.0;
 
     juce::AudioDeviceManager deviceManager;
     juce::AudioPluginFormatManager formatManager;

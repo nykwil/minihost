@@ -1,9 +1,11 @@
 #include <JuceHeader.h>
+#include <cmath>
+#include <limits>
 #include "HostApp.h"
 HostApp::HostApp()
 {
     audioFormatManager.registerBasicFormats();
-    formatManager.addFormat(new juce::VST3PluginFormat());
+    formatManager.addFormat(std::make_unique<juce::VST3PluginFormat>());
 }
 
 HostApp::~HostApp()
@@ -11,14 +13,22 @@ HostApp::~HostApp()
     shutdown();
 }
 
-bool HostApp::initialise(const juce::String& pluginPath)
+bool HostApp::initialise(const juce::String& pluginPath,
+                         const juce::String& configPath,
+                         double bpmOverride)
 {
     juce::Logger::writeToLog("HostApp::initialise called.");
     
-    // Parse minihost_config.json for audio/midi file paths
-    parseConfig();
+    // Parse config for audio/midi file paths (default: working directory)
+    parseConfig(configPath);
+
+    if (bpmOverride > 0.0)
+    {
+        configuredBpm = bpmOverride;
+        juce::Logger::writeToLog("BPM override applied from command line: " + juce::String(configuredBpm, 2));
+    }
+
     // Initialize standard audio and MIDI devices
-    auto setup = deviceManager.getAudioDeviceSetup();
     juce::Logger::writeToLog("Initializing default audio devices...");
     auto err = deviceManager.initialiseWithDefaultDevices(2, 2);
     juce::Logger::writeToLog("Audio devices initialized.");
@@ -126,9 +136,20 @@ bool HostApp::runTest()
     return true;
 }
 
-void HostApp::parseConfig()
+void HostApp::parseConfig(const juce::String& configPath)
 {
-    juce::File configFile = juce::File::getCurrentWorkingDirectory().getChildFile("minihost_config.json");
+    juce::File configFile;
+    if (configPath.isNotEmpty())
+    {
+        configFile = juce::File(configPath);
+        juce::Logger::writeToLog("Using config path from command line: " + configFile.getFullPathName());
+    }
+    else
+    {
+        configFile = juce::File::getCurrentWorkingDirectory().getChildFile("minihost_config.json");
+        juce::Logger::writeToLog("Using default config path in working directory: " + configFile.getFullPathName());
+    }
+
     if (!configFile.existsAsFile())
     {
         juce::Logger::writeToLog("No minihost_config.json found, using internal generated sequences.");
@@ -147,13 +168,48 @@ void HostApp::parseConfig()
         if (obj->hasProperty("audio_file"))
         {
             audioFilePath = obj->getProperty("audio_file").toString();
+            if (audioFilePath.isNotEmpty() && !juce::File::isAbsolutePath(audioFilePath))
+                audioFilePath = configFile.getParentDirectory().getChildFile(audioFilePath).getFullPathName();
             juce::Logger::writeToLog("Config loaded audio_file: " + audioFilePath);
         }
         if (obj->hasProperty("midi_file"))
         {
             midiFilePath = obj->getProperty("midi_file").toString();
+            if (midiFilePath.isNotEmpty() && !juce::File::isAbsolutePath(midiFilePath))
+                midiFilePath = configFile.getParentDirectory().getChildFile(midiFilePath).getFullPathName();
             juce::Logger::writeToLog("Config loaded midi_file: " + midiFilePath);
         }
+        if (obj->hasProperty("bpm"))
+        {
+            auto bpm = static_cast<double>(obj->getProperty("bpm"));
+            if (bpm > 0.0)
+            {
+                configuredBpm = bpm;
+                juce::Logger::writeToLog("Config loaded bpm: " + juce::String(configuredBpm, 2));
+            }
+            else
+            {
+                juce::Logger::writeToLog("Ignoring invalid bpm in config (must be > 0).");
+            }
+        }
+    }
+}
+
+void HostApp::applyBpmToMidiSequence(double bpm)
+{
+    if (midiSequence.getNumEvents() == 0 || bpm <= 0.0)
+        return;
+
+    // JUCE conversion defaults to 120 BPM when no tempo map is present.
+    // Scaling by 120/bpm provides a simple user BPM control.
+    const double timeScale = 120.0 / bpm;
+    if (std::abs(timeScale - 1.0) < 1.0e-9)
+        return;
+
+    for (int i = 0; i < midiSequence.getNumEvents(); ++i)
+    {
+        if (auto* event = midiSequence.getEventPointer(i))
+            event->message.setTimeStamp(event->message.getTimeStamp() * timeScale);
     }
 }
 
@@ -167,6 +223,10 @@ void HostApp::audioDeviceAboutToStart (juce::AudioIODevice* device)
 
     pluginInstance->prepareToPlay (sampleRate, blockSize);
     internalBuffer.setSize(pluginInstance->getTotalNumInputChannels(), blockSize);
+
+    playbackSamplePosition = 0;
+    nextMidiEventIndex = 0;
+    midiSequence.clear();
 
     // Initialize audio reading if specified
     if (audioFilePath.isNotEmpty())
@@ -202,8 +262,29 @@ void HostApp::audioDeviceAboutToStart (juce::AudioIODevice* device)
                 {
                     midiSequence.addSequence(*parsedMidi.getTrack(i), 0.0);
                 }
+
+                applyBpmToMidiSequence(configuredBpm);
+
+                // Align first MIDI event with sample start by removing leading silence.
+                double firstPlayableEventTime = std::numeric_limits<double>::max();
+                for (int i = 0; i < midiSequence.getNumEvents(); ++i)
+                {
+                    if (auto* event = midiSequence.getEventPointer(i); event != nullptr && !event->message.isMetaEvent())
+                        firstPlayableEventTime = std::min(firstPlayableEventTime, event->message.getTimeStamp());
+                }
+
+                if (firstPlayableEventTime != std::numeric_limits<double>::max() && firstPlayableEventTime > 0.0)
+                {
+                    for (int i = 0; i < midiSequence.getNumEvents(); ++i)
+                    {
+                        if (auto* event = midiSequence.getEventPointer(i))
+                            event->message.setTimeStamp(juce::jmax(0.0, event->message.getTimeStamp() - firstPlayableEventTime));
+                    }
+                }
+
                 midiSequence.updateMatchedPairs();
-                juce::Logger::writeToLog("Loaded MIDI file for playback: " + midiFilePath);
+                juce::Logger::writeToLog("Loaded MIDI file for playback: " + midiFilePath
+                    + " (BPM: " + juce::String(configuredBpm, 2) + ")");
             }
         }
         else
@@ -211,11 +292,8 @@ void HostApp::audioDeviceAboutToStart (juce::AudioIODevice* device)
             juce::Logger::writeToLog("Failed to read MIDI file: " + midiFilePath);
         }
     }
-    nextMidiEventIndex = 0;
-
-    // Initialize fallback MIDI timing (120 BPM quarter notes)
-    const double bpm = 120.0;
-    const double secondsPerBeat = 60.0 / bpm;
+    // Initialize fallback MIDI timing (quarter notes at configured BPM)
+    const double secondsPerBeat = 60.0 / configuredBpm;
     fallbackNoteLengthSamples = static_cast<int64_t>(secondsPerBeat * sampleRate);
     fallbackRestLengthSamples = static_cast<int64_t>(secondsPerBeat * sampleRate);
     fallbackMidiSampleCounter = 0;
@@ -242,6 +320,8 @@ void HostApp::audioDeviceIOCallbackWithContext (const float* const* inputChannel
                                                 int numSamples,
                                                 const juce::AudioIODeviceCallbackContext& context)
 {
+    juce::ignoreUnused(inputChannelData, numInputChannels, context);
+
     if (pluginInstance == nullptr)
         return;
 
