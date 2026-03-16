@@ -1,0 +1,8 @@
+{
+  "audio_1": "Samples\\input.wav",
+  "audio_2": 1,
+  "midi_1": "Samples\\sequence.mid",
+  "midi_2": 1,
+  "log_path": "logs\\minihost.log",
+  "bpm": 120
+}
