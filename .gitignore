@@ -20,6 +20,10 @@ CTestTestfile.cmake
 *.dylib
 *.dll
 *.exe
+*.log
+
+# Local runtime config
+minihost_config.json
 
 # IDE/editor
 .vs/

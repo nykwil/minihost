@@ -1,6 +1,77 @@
-#include <algorithm>
+#include <cstdio>
 #include <JuceHeader.h>
 #include "HostApp.h"
+
+namespace
+{
+class CompositeLogger : public juce::Logger
+{
+public:
+    CompositeLogger(bool logToConsoleIn, std::unique_ptr<juce::FileLogger> fileLoggerIn)
+        : logToConsole(logToConsoleIn), fileLogger(std::move(fileLoggerIn))
+    {
+    }
+
+    void logMessage(const juce::String& message) override
+    {
+        if (logToConsole)
+        {
+            const auto lower = message.toLowerCase();
+            const bool isErrorLike = lower.startsWith("error")
+                || lower.contains("failed")
+                || lower.contains("invalid");
+            auto* stream = isErrorLike ? stderr : stdout;
+            std::fputs(message.toRawUTF8(), stream);
+            std::fputc('\n', stream);
+            std::fflush(stream);
+        }
+
+        if (fileLogger != nullptr)
+            fileLogger->logMessage(message);
+    }
+
+private:
+    bool logToConsole = false;
+    std::unique_ptr<juce::FileLogger> fileLogger;
+};
+
+juce::File getDefaultConfigFile(const juce::String& configPath)
+{
+    if (configPath.isNotEmpty())
+        return juce::File(configPath);
+
+    return juce::File::getCurrentWorkingDirectory().getChildFile("minihost_config.json");
+}
+
+juce::String getConfiguredLogPath(const juce::File& configFile)
+{
+    if (!configFile.existsAsFile())
+        return {};
+
+    const auto parsed = juce::JSON::parse(configFile.loadFileAsString());
+    if (!parsed.isObject())
+        return {};
+
+    if (auto* obj = parsed.getDynamicObject())
+    {
+        if (obj->hasProperty("log_path"))
+            return obj->getProperty("log_path").toString();
+    }
+
+    return {};
+}
+
+juce::File resolveLogFile(const juce::String& logPath, const juce::File& configFile)
+{
+    if (logPath.isEmpty())
+        return {};
+
+    if (juce::File::isAbsolutePath(logPath))
+        return juce::File(logPath);
+
+    return configFile.getParentDirectory().getChildFile(logPath);
+}
+}
 
 class PluginWindow : public juce::DocumentWindow
 {
@@ -43,28 +114,18 @@ public:
     {
         juce::ignoreUnused(commandLine);
 
-        // Set up a simple file logger on the Desktop
-        juce::File logFile = juce::File::getSpecialLocation(juce::File::userDesktopDirectory).getChildFile("minihost.log");
-        if (logFile.exists()) logFile.deleteFile();
-        fileLogger = new juce::FileLogger(logFile, "Log started");
-        
-        juce::Logger::setCurrentLogger(fileLogger);
-        juce::Logger::writeToLog("Logger initialized. Getting command line args...");
-
         auto args = juce::JUCEApplication::getCommandLineParameterArray();
-        if (args.isEmpty())
-        {
-            juce::Logger::writeToLog("Error: No plugin path provided. Usage: minihost [--test] [--config <path_to_json>] [--bpm <value>] <path_to_vst3>");
-            juce::JUCEApplication::quit();
-            return;
-        }
-
         bool runTestingMode = false;
         juce::String pluginPath;
         juce::String configPath;
         double bpmOverride = 0.0;
+        juce::String argumentError;
 
-        for (int i = 0; i < args.size(); ++i)
+        if (args.isEmpty())
+        {
+            argumentError = "Error: No plugin path provided. Usage: minihost [--test] [--config <path_to_json>] [--bpm <value>] <path_to_vst3>";
+        }
+        else for (int i = 0; i < args.size(); ++i)
         {
             const auto& arg = args[i];
 
@@ -78,9 +139,8 @@ public:
                     configPath = args[++i];
                 else
                 {
-                    juce::Logger::writeToLog("Error: --config requires a path argument.");
-                    juce::JUCEApplication::quit();
-                    return;
+                    argumentError = "Error: --config requires a path argument.";
+                    break;
                 }
             }
             else if (arg.startsWith("--config="))
@@ -94,16 +154,14 @@ public:
                     bpmOverride = args[++i].getDoubleValue();
                     if (bpmOverride <= 0.0)
                     {
-                        juce::Logger::writeToLog("Error: --bpm requires a numeric value > 0.");
-                        juce::JUCEApplication::quit();
-                        return;
+                        argumentError = "Error: --bpm requires a numeric value > 0.";
+                        break;
                     }
                 }
                 else
                 {
-                    juce::Logger::writeToLog("Error: --bpm requires a value.");
-                    juce::JUCEApplication::quit();
-                    return;
+                    argumentError = "Error: --bpm requires a value.";
+                    break;
                 }
             }
             else if (arg.startsWith("--bpm="))
@@ -111,9 +169,8 @@ public:
                 bpmOverride = arg.fromFirstOccurrenceOf("=", false, false).getDoubleValue();
                 if (bpmOverride <= 0.0)
                 {
-                    juce::Logger::writeToLog("Error: --bpm requires a numeric value > 0.");
-                    juce::JUCEApplication::quit();
-                    return;
+                    argumentError = "Error: --bpm requires a numeric value > 0.";
+                    break;
                 }
             }
             else
@@ -121,10 +178,40 @@ public:
                 pluginPath = arg; // We'll assume the last non-flag argument is the path
             }
         }
-        
-        if (pluginPath.isEmpty())
+
+        if (argumentError.isEmpty() && pluginPath.isEmpty())
+            argumentError = "Error: No plugin path provided.";
+
+        const auto configFileForLogging = getDefaultConfigFile(configPath);
+        const auto configuredLogPath = getConfiguredLogPath(configFileForLogging);
+        juce::File resolvedLogFile = resolveLogFile(configuredLogPath, configFileForLogging);
+
+        if (resolvedLogFile == juce::File())
         {
-            juce::Logger::writeToLog("Error: No plugin path provided.");
+            // Keep GUI mode behavior stable when no explicit log_path is set.
+            if (!runTestingMode)
+                resolvedLogFile = juce::File::getSpecialLocation(juce::File::userDesktopDirectory).getChildFile("minihost.log");
+        }
+
+        std::unique_ptr<juce::FileLogger> fileLogger;
+        if (resolvedLogFile != juce::File())
+        {
+            if (resolvedLogFile.existsAsFile())
+                resolvedLogFile.deleteFile();
+            fileLogger = std::make_unique<juce::FileLogger>(resolvedLogFile, "Log started");
+        }
+
+        activeLogger = std::make_unique<CompositeLogger>(runTestingMode, std::move(fileLogger));
+        juce::Logger::setCurrentLogger(activeLogger.get());
+        juce::Logger::writeToLog("Logger initialized. Getting command line args...");
+        if (resolvedLogFile != juce::File())
+            juce::Logger::writeToLog("Log file path: " + resolvedLogFile.getFullPathName());
+        else
+            juce::Logger::writeToLog("Log file path: none (console-only).");
+
+        if (argumentError.isNotEmpty())
+        {
+            juce::Logger::writeToLog(argumentError);
             juce::JUCEApplication::quit();
             return;
         }
@@ -182,7 +269,7 @@ public:
         hostApp.reset();
         juce::Logger::writeToLog("Host shut down.");
         juce::Logger::setCurrentLogger(nullptr);
-        delete fileLogger;
+        activeLogger.reset();
     }
 
     void systemRequestedQuit() override
@@ -191,7 +278,7 @@ public:
     }
 
 private:
-    juce::Logger* fileLogger = nullptr;
+    std::unique_ptr<juce::Logger> activeLogger;
     std::unique_ptr<HostApp> hostApp;
     std::unique_ptr<PluginWindow> mainWindow;
 };

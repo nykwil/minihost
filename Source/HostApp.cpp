@@ -1,7 +1,79 @@
 #include <JuceHeader.h>
 #include <cmath>
 #include <limits>
+#include <map>
 #include "HostApp.h"
+
+namespace
+{
+class ScopedPluginPlayHead
+{
+public:
+    ScopedPluginPlayHead(juce::AudioProcessor& processorIn, juce::AudioPlayHead& playHeadIn)
+        : processor(processorIn), shouldSetPlayHead(processor.getPlayHead() == nullptr)
+    {
+        if (shouldSetPlayHead)
+            processor.setPlayHead(&playHeadIn);
+    }
+
+    ~ScopedPluginPlayHead()
+    {
+        if (shouldSetPlayHead)
+            processor.setPlayHead(nullptr);
+    }
+
+private:
+    juce::AudioProcessor& processor;
+    bool shouldSetPlayHead = false;
+};
+
+bool tryParseIndexedSlotKey(const juce::Identifier& key, const juce::String& prefix, int& slotIndexOut)
+{
+    const auto keyText = key.toString();
+    const auto expectedPrefix = prefix + "_";
+    if (!keyText.startsWithIgnoreCase(expectedPrefix))
+        return false;
+
+    const auto slotText = keyText.substring(expectedPrefix.length());
+    if (slotText.isEmpty() || !slotText.containsOnly("0123456789"))
+        return false;
+
+    const auto slotIndex = slotText.getIntValue();
+    if (slotIndex <= 0)
+        return false;
+
+    slotIndexOut = slotIndex;
+    return true;
+}
+
+bool tryParseIntegerId(const juce::var& value, int& idOut)
+{
+    if (value.isInt() || value.isInt64())
+    {
+        idOut = static_cast<int>(value);
+        return true;
+    }
+
+    if (value.isDouble())
+    {
+        const auto valueAsDouble = static_cast<double>(value);
+        if (std::floor(valueAsDouble) == valueAsDouble)
+        {
+            idOut = static_cast<int>(valueAsDouble);
+            return true;
+        }
+    }
+
+    return false;
+}
+
+int resolveRequestedIdToZeroBasedIndex(int requestedId)
+{
+    // Config IDs are intended to be one-based (1 = first channel/device), but we accept 0 as first too.
+    return requestedId > 0 ? requestedId - 1 : requestedId;
+}
+}
+
 HostApp::HostApp()
 {
     audioFormatManager.registerBasicFormats();
@@ -18,8 +90,7 @@ bool HostApp::initialise(const juce::String& pluginPath,
                          double bpmOverride)
 {
     juce::Logger::writeToLog("HostApp::initialise called.");
-    
-    // Parse config for audio/midi file paths (default: working directory)
+
     parseConfig(configPath);
 
     if (bpmOverride > 0.0)
@@ -28,7 +99,6 @@ bool HostApp::initialise(const juce::String& pluginPath,
         juce::Logger::writeToLog("BPM override applied from command line: " + juce::String(configuredBpm, 2));
     }
 
-    // Initialize standard audio and MIDI devices
     juce::Logger::writeToLog("Initializing default audio devices...");
     auto err = deviceManager.initialiseWithDefaultDevices(2, 2);
     juce::Logger::writeToLog("Audio devices initialized.");
@@ -38,18 +108,6 @@ bool HostApp::initialise(const juce::String& pluginPath,
         return false;
     }
 
-    // Enable MIDI input from all available devices
-    juce::Logger::writeToLog("Getting MIDI inputs...");
-    auto midiInputs = juce::MidiInput::getAvailableDevices();
-    for (const auto& input : midiInputs)
-    {
-        deviceManager.setMidiInputDeviceEnabled(input.identifier, true);
-    }
-
-    // We no longer use processorPlayer.
-    // Instead we drive the AudioIODeviceCallback directly.
-    // deviceManager.addMidiInputDeviceCallback({}, &processorPlayer);
-
     juce::File pluginFile(pluginPath);
     if (!pluginFile.existsAsFile() && !pluginFile.isDirectory())
     {
@@ -57,22 +115,16 @@ bool HostApp::initialise(const juce::String& pluginPath,
         return false;
     }
 
-    juce::KnownPluginList pluginList;
     juce::VST3PluginFormat vst3Format;
 
     juce::String fileOrId = pluginFile.getFullPathName();
     juce::Logger::writeToLog("Scanning: " + fileOrId);
 
-    juce::PluginDirectoryScanner scanner(pluginList, vst3Format, {}, true, juce::File());
-
     juce::OwnedArray<juce::PluginDescription> typesFound;
-    
-    // Instead of instantiating blindly, let's scan it as a VST3 explicitly
+
     if (!vst3Format.fileMightContainThisPluginType(fileOrId))
-    {
         juce::Logger::writeToLog("Warning: fileMightContainThisPluginType returned false.");
-    }
-    
+
     vst3Format.findAllTypesForFile(typesFound, fileOrId);
 
     if (typesFound.size() == 0)
@@ -94,15 +146,52 @@ bool HostApp::initialise(const juce::String& pluginPath,
 
     juce::Logger::writeToLog("Successfully loaded plugin: " + pluginInstance->getName());
 
-    // Connect audio callback directly to HostApp
-    deviceManager.addAudioCallback(this);
+    const auto midiInputs = juce::MidiInput::getAvailableDevices();
+    for (auto& slot : midiInputSlots)
+    {
+        if (slot.sourceType != MidiInputSlot::SourceType::Device)
+            continue;
 
+        const auto deviceIndex = resolveRequestedIdToZeroBasedIndex(slot.requestedDeviceId);
+        if (!juce::isPositiveAndBelow(deviceIndex, midiInputs.size()))
+        {
+            juce::Logger::writeToLog("midi_" + juce::String(slot.slotIndex)
+                + " requested invalid device ID " + juce::String(slot.requestedDeviceId)
+                + " (available MIDI devices: " + juce::String(midiInputs.size()) + ")");
+            continue;
+        }
+
+        const auto& deviceInfo = midiInputs.getReference(deviceIndex);
+        slot.deviceIdentifier = deviceInfo.identifier;
+        if (!activeMidiDeviceIdentifiers.contains(slot.deviceIdentifier))
+        {
+            deviceManager.setMidiInputDeviceEnabled(slot.deviceIdentifier, true);
+            deviceManager.addMidiInputDeviceCallback(slot.deviceIdentifier, this);
+            activeMidiDeviceIdentifiers.add(slot.deviceIdentifier);
+        }
+
+        juce::Logger::writeToLog("midi_" + juce::String(slot.slotIndex) + " mapped to MIDI device #"
+            + juce::String(slot.requestedDeviceId) + ": " + deviceInfo.name);
+    }
+
+    logRoutingSummary();
+
+    deviceManager.addAudioCallback(this);
     return true;
 }
 
 void HostApp::shutdown()
 {
     deviceManager.removeAudioCallback(this);
+
+    for (const auto& identifier : activeMidiDeviceIdentifiers)
+    {
+        deviceManager.removeMidiInputDeviceCallback(identifier, this);
+        deviceManager.setMidiInputDeviceEnabled(identifier, false);
+    }
+    activeMidiDeviceIdentifiers.clear();
+
+    releasePlaybackState();
     pluginInstance.reset();
 }
 
@@ -112,32 +201,32 @@ bool HostApp::runTest()
         return false;
 
     juce::Logger::writeToLog("--- Starting Test Mode ---");
-
-    // No live audio callback to disconnect (we are the callback)
+    logRoutingSummary();
 
     const int numBlocksToProcess = 10;
     const int bufferSize = 512;
     const double sampleRate = 44100.0;
-
-    pluginInstance->prepareToPlay(sampleRate, bufferSize);
-
-    juce::AudioBuffer<float> buffer(pluginInstance->getTotalNumOutputChannels(), bufferSize);
-    juce::MidiBuffer midiBuffer;
+    preparePlaybackState(sampleRate, bufferSize);
+    ScopedPluginPlayHead scopedPlayHead(*pluginInstance, hostTransportPlayHead);
 
     for (int i = 0; i < numBlocksToProcess; ++i)
-    {
-        buffer.clear();
-        pluginInstance->processBlock(buffer, midiBuffer);
-    }
+        renderNextBlock(nullptr, 0, bufferSize);
+
+    pluginInstance->releaseResources();
+    releasePlaybackState();
 
     juce::Logger::writeToLog("Processed " + juce::String(numBlocksToProcess) + " blocks successfully.");
-
-    // We do not re-add the callback here because the app will shut down immediately after testing
     return true;
 }
 
 void HostApp::parseConfig(const juce::String& configPath)
 {
+    audioInputSlots.clear();
+    midiInputSlots.clear();
+    hasConfiguredAudioSlots = false;
+    hasConfiguredMidiSlots = false;
+    hasLoadedMidiFileSequence = false;
+
     juce::File configFile;
     if (configPath.isNotEmpty())
     {
@@ -163,22 +252,116 @@ void HostApp::parseConfig(const juce::String& configPath)
         return;
     }
 
+    auto resolvePathFromConfig = [&](juce::String path) -> juce::String
+    {
+        if (path.isNotEmpty() && !juce::File::isAbsolutePath(path))
+            path = configFile.getParentDirectory().getChildFile(path).getFullPathName();
+        return path;
+    };
+
     if (auto* obj = config.getDynamicObject())
     {
-        if (obj->hasProperty("audio_file"))
+        std::map<int, juce::var> audioSlotsFromConfig;
+        std::map<int, juce::var> midiSlotsFromConfig;
+
+        const auto& properties = obj->getProperties();
+        for (int i = 0; i < properties.size(); ++i)
         {
-            audioFilePath = obj->getProperty("audio_file").toString();
-            if (audioFilePath.isNotEmpty() && !juce::File::isAbsolutePath(audioFilePath))
-                audioFilePath = configFile.getParentDirectory().getChildFile(audioFilePath).getFullPathName();
-            juce::Logger::writeToLog("Config loaded audio_file: " + audioFilePath);
+            const auto propertyName = properties.getName(i);
+            const auto propertyValue = properties.getValueAt(i);
+
+            int slotIndex = 0;
+            if (tryParseIndexedSlotKey(propertyName, "audio", slotIndex))
+                audioSlotsFromConfig[slotIndex] = propertyValue;
+            else if (tryParseIndexedSlotKey(propertyName, "midi", slotIndex))
+                midiSlotsFromConfig[slotIndex] = propertyValue;
         }
-        if (obj->hasProperty("midi_file"))
+
+        // Backwards compatibility with legacy keys.
+        if (audioSlotsFromConfig.empty() && obj->hasProperty("audio_file"))
+            audioSlotsFromConfig[1] = obj->getProperty("audio_file");
+        if (midiSlotsFromConfig.empty() && obj->hasProperty("midi_file"))
+            midiSlotsFromConfig[1] = obj->getProperty("midi_file");
+
+        for (const auto& [slotIndex, slotValue] : audioSlotsFromConfig)
         {
-            midiFilePath = obj->getProperty("midi_file").toString();
-            if (midiFilePath.isNotEmpty() && !juce::File::isAbsolutePath(midiFilePath))
-                midiFilePath = configFile.getParentDirectory().getChildFile(midiFilePath).getFullPathName();
-            juce::Logger::writeToLog("Config loaded midi_file: " + midiFilePath);
+            AudioInputSlot slot;
+            slot.slotIndex = slotIndex;
+            slot.pluginInputChannel = slotIndex - 1;
+
+            int requestedId = 0;
+            if (tryParseIntegerId(slotValue, requestedId))
+            {
+                if (requestedId < 0)
+                {
+                    juce::Logger::writeToLog("Ignoring audio_" + juce::String(slotIndex)
+                        + ": device ID must be >= 0.");
+                    continue;
+                }
+
+                slot.sourceType = AudioInputSlot::SourceType::DeviceChannel;
+                slot.requestedDeviceId = requestedId;
+                slot.deviceInputChannel = resolveRequestedIdToZeroBasedIndex(requestedId);
+                juce::Logger::writeToLog("Config loaded audio_" + juce::String(slotIndex)
+                    + " as device input channel ID " + juce::String(requestedId));
+            }
+            else if (slotValue.isString())
+            {
+                slot.sourceType = AudioInputSlot::SourceType::File;
+                slot.filePath = resolvePathFromConfig(slotValue.toString());
+                juce::Logger::writeToLog("Config loaded audio_" + juce::String(slotIndex)
+                    + " as file: " + slot.filePath);
+            }
+            else
+            {
+                juce::Logger::writeToLog("Ignoring audio_" + juce::String(slotIndex)
+                    + ": expected string file path or integer device/channel ID.");
+                continue;
+            }
+
+            audioInputSlots.push_back(std::move(slot));
         }
+
+        for (const auto& [slotIndex, slotValue] : midiSlotsFromConfig)
+        {
+            MidiInputSlot slot;
+            slot.slotIndex = slotIndex;
+
+            int requestedId = 0;
+            if (tryParseIntegerId(slotValue, requestedId))
+            {
+                if (requestedId < 0)
+                {
+                    juce::Logger::writeToLog("Ignoring midi_" + juce::String(slotIndex)
+                        + ": device ID must be >= 0.");
+                    continue;
+                }
+
+                slot.sourceType = MidiInputSlot::SourceType::Device;
+                slot.requestedDeviceId = requestedId;
+                juce::Logger::writeToLog("Config loaded midi_" + juce::String(slotIndex)
+                    + " as MIDI device ID " + juce::String(requestedId));
+            }
+            else if (slotValue.isString())
+            {
+                slot.sourceType = MidiInputSlot::SourceType::File;
+                slot.filePath = resolvePathFromConfig(slotValue.toString());
+                juce::Logger::writeToLog("Config loaded midi_" + juce::String(slotIndex)
+                    + " as file: " + slot.filePath);
+            }
+            else
+            {
+                juce::Logger::writeToLog("Ignoring midi_" + juce::String(slotIndex)
+                    + ": expected string MIDI file path or integer MIDI device ID.");
+                continue;
+            }
+
+            midiInputSlots.push_back(std::move(slot));
+        }
+
+        hasConfiguredAudioSlots = !audioInputSlots.empty();
+        hasConfiguredMidiSlots = !midiInputSlots.empty();
+
         if (obj->hasProperty("bpm"))
         {
             auto bpm = static_cast<double>(obj->getProperty("bpm"));
@@ -213,86 +396,201 @@ void HostApp::applyBpmToMidiSequence(double bpm)
     }
 }
 
-void HostApp::audioDeviceAboutToStart (juce::AudioIODevice* device)
+void HostApp::logRoutingSummary()
 {
     if (pluginInstance == nullptr)
         return;
 
-    auto sampleRate = device->getCurrentSampleRate();
-    auto blockSize  = device->getCurrentBufferSizeSamples();
+    juce::Logger::writeToLog("--- Routing Summary ---");
+    juce::Logger::writeToLog("Plugin: " + pluginInstance->getName());
+    juce::Logger::writeToLog("Plugin total input channels: " + juce::String(pluginInstance->getTotalNumInputChannels()));
+    juce::Logger::writeToLog("Plugin total output channels: " + juce::String(pluginInstance->getTotalNumOutputChannels()));
 
-    pluginInstance->prepareToPlay (sampleRate, blockSize);
-    internalBuffer.setSize(pluginInstance->getTotalNumInputChannels(), blockSize);
+    const auto numInputBuses = pluginInstance->getBusCount(true);
+    const auto numOutputBuses = pluginInstance->getBusCount(false);
+    juce::Logger::writeToLog("Plugin input buses: " + juce::String(numInputBuses));
+    for (int i = 0; i < numInputBuses; ++i)
+    {
+        if (const auto* bus = pluginInstance->getBus(true, i))
+        {
+            juce::Logger::writeToLog("  In bus " + juce::String(i + 1) + ": "
+                + bus->getName() + " (" + juce::String(bus->getNumberOfChannels()) + " ch)");
+        }
+    }
+
+    juce::Logger::writeToLog("Plugin output buses: " + juce::String(numOutputBuses));
+    for (int i = 0; i < numOutputBuses; ++i)
+    {
+        if (const auto* bus = pluginInstance->getBus(false, i))
+        {
+            juce::Logger::writeToLog("  Out bus " + juce::String(i + 1) + ": "
+                + bus->getName() + " (" + juce::String(bus->getNumberOfChannels()) + " ch)");
+        }
+    }
+
+    if (const auto* device = deviceManager.getCurrentAudioDevice())
+    {
+        juce::Logger::writeToLog("Current audio device: " + device->getName()
+            + " (active input channels: "
+            + juce::String(device->getActiveInputChannels().countNumberOfSetBits())
+            + ", active output channels: "
+            + juce::String(device->getActiveOutputChannels().countNumberOfSetBits()) + ")");
+    }
+
+    const auto midiDevices = juce::MidiInput::getAvailableDevices();
+    juce::Logger::writeToLog("Available MIDI input devices: " + juce::String(midiDevices.size()));
+    for (int i = 0; i < midiDevices.size(); ++i)
+        juce::Logger::writeToLog("  MIDI device ID " + juce::String(i + 1) + ": " + midiDevices.getReference(i).name);
+
+    if (audioInputSlots.empty())
+    {
+        juce::Logger::writeToLog("Audio input slots: none configured (fallback sine wave enabled).");
+    }
+    else
+    {
+        juce::Logger::writeToLog("Audio input slots: " + juce::String(audioInputSlots.size()));
+        for (const auto& slot : audioInputSlots)
+        {
+            if (slot.sourceType == AudioInputSlot::SourceType::File)
+            {
+                juce::Logger::writeToLog("  audio_" + juce::String(slot.slotIndex)
+                    + " -> plugin input channel " + juce::String(slot.pluginInputChannel + 1)
+                    + " from file: " + slot.filePath);
+            }
+            else
+            {
+                juce::Logger::writeToLog("  audio_" + juce::String(slot.slotIndex)
+                    + " -> plugin input channel " + juce::String(slot.pluginInputChannel + 1)
+                    + " from audio input channel ID " + juce::String(slot.requestedDeviceId));
+            }
+        }
+    }
+
+    if (midiInputSlots.empty())
+    {
+        juce::Logger::writeToLog("MIDI input slots: none configured (fallback MIDI pattern enabled).");
+    }
+    else
+    {
+        juce::Logger::writeToLog("MIDI input slots: " + juce::String(midiInputSlots.size()));
+        for (const auto& slot : midiInputSlots)
+        {
+            if (slot.sourceType == MidiInputSlot::SourceType::File)
+            {
+                juce::Logger::writeToLog("  midi_" + juce::String(slot.slotIndex)
+                    + " -> MIDI file: " + slot.filePath);
+            }
+            else
+            {
+                juce::Logger::writeToLog("  midi_" + juce::String(slot.slotIndex)
+                    + " -> MIDI device ID " + juce::String(slot.requestedDeviceId));
+            }
+        }
+    }
+}
+
+void HostApp::preparePlaybackState(double sampleRate, int blockSize)
+{
+    if (pluginInstance == nullptr)
+        return;
+
+    const auto processChannels = juce::jmax(pluginInstance->getTotalNumInputChannels(),
+                                            pluginInstance->getTotalNumOutputChannels());
+
+    pluginInstance->prepareToPlay(sampleRate, blockSize);
+    internalBuffer.setSize(processChannels, blockSize);
+    slotScratchBuffer.setSize(1, blockSize, false, false, true);
 
     playbackSamplePosition = 0;
     nextMidiEventIndex = 0;
     midiSequence.clear();
+    hasLoadedMidiFileSequence = false;
 
-    // Initialize audio reading if specified
-    if (audioFilePath.isNotEmpty())
+    for (auto& slot : audioInputSlots)
     {
-        juce::File audioFile(audioFilePath);
+        slot.warnedInvalidChannel = false;
+        slot.readerSource.reset();
+        slot.transportSource.reset();
+
+        if (slot.sourceType != AudioInputSlot::SourceType::File)
+            continue;
+
+        juce::File audioFile(slot.filePath);
         if (auto* reader = audioFormatManager.createReaderFor(audioFile))
         {
-            audioReaderSource = std::make_unique<juce::AudioFormatReaderSource>(reader, true);
-            audioTransportSource = std::make_unique<juce::AudioTransportSource>();
-            audioTransportSource->setSource(audioReaderSource.get(), 0, nullptr, reader->sampleRate);
-            audioTransportSource->prepareToPlay(blockSize, sampleRate);
-            audioTransportSource->start();
-            juce::Logger::writeToLog("Loaded audio file for playback: " + audioFilePath);
+            slot.readerSource = std::make_unique<juce::AudioFormatReaderSource>(reader, true);
+            slot.transportSource = std::make_unique<juce::AudioTransportSource>();
+            slot.transportSource->setSource(slot.readerSource.get(), 0, nullptr, reader->sampleRate);
+            slot.transportSource->prepareToPlay(blockSize, sampleRate);
+            slot.transportSource->start();
+            juce::Logger::writeToLog("Loaded audio file for audio_" + juce::String(slot.slotIndex)
+                + ": " + slot.filePath);
         }
         else
         {
-            juce::Logger::writeToLog("Failed to read audio file: " + audioFilePath);
+            juce::Logger::writeToLog("Failed to read audio file for audio_" + juce::String(slot.slotIndex)
+                + ": " + slot.filePath);
         }
     }
 
-    if (midiFilePath.isNotEmpty())
+    int loadedMidiFiles = 0;
+    for (const auto& slot : midiInputSlots)
     {
-        juce::File midiFile(midiFilePath);
+        if (slot.sourceType != MidiInputSlot::SourceType::File)
+            continue;
+
+        juce::File midiFile(slot.filePath);
         juce::FileInputStream midiFileStream(midiFile);
-        if (midiFileStream.openedOk())
+        if (!midiFileStream.openedOk())
         {
-            juce::MidiFile parsedMidi;
-            if (parsedMidi.readFrom(midiFileStream))
+            juce::Logger::writeToLog("Failed to read MIDI file for midi_" + juce::String(slot.slotIndex)
+                + ": " + slot.filePath);
+            continue;
+        }
+
+        juce::MidiFile parsedMidi;
+        if (!parsedMidi.readFrom(midiFileStream))
+        {
+            juce::Logger::writeToLog("Failed to parse MIDI file for midi_" + juce::String(slot.slotIndex)
+                + ": " + slot.filePath);
+            continue;
+        }
+
+        parsedMidi.convertTimestampTicksToSeconds();
+        for (int trackIndex = 0; trackIndex < parsedMidi.getNumTracks(); ++trackIndex)
+            midiSequence.addSequence(*parsedMidi.getTrack(trackIndex), 0.0);
+
+        ++loadedMidiFiles;
+    }
+
+    if (midiSequence.getNumEvents() > 0)
+    {
+        applyBpmToMidiSequence(configuredBpm);
+
+        double firstPlayableEventTime = std::numeric_limits<double>::max();
+        for (int i = 0; i < midiSequence.getNumEvents(); ++i)
+        {
+            if (auto* event = midiSequence.getEventPointer(i); event != nullptr && !event->message.isMetaEvent())
+                firstPlayableEventTime = std::min(firstPlayableEventTime, event->message.getTimeStamp());
+        }
+
+        if (firstPlayableEventTime != std::numeric_limits<double>::max() && firstPlayableEventTime > 0.0)
+        {
+            for (int i = 0; i < midiSequence.getNumEvents(); ++i)
             {
-                parsedMidi.convertTimestampTicksToSeconds();
-                int numTracks = parsedMidi.getNumTracks();
-                for (int i = 0; i < numTracks; ++i)
-                {
-                    midiSequence.addSequence(*parsedMidi.getTrack(i), 0.0);
-                }
-
-                applyBpmToMidiSequence(configuredBpm);
-
-                // Align first MIDI event with sample start by removing leading silence.
-                double firstPlayableEventTime = std::numeric_limits<double>::max();
-                for (int i = 0; i < midiSequence.getNumEvents(); ++i)
-                {
-                    if (auto* event = midiSequence.getEventPointer(i); event != nullptr && !event->message.isMetaEvent())
-                        firstPlayableEventTime = std::min(firstPlayableEventTime, event->message.getTimeStamp());
-                }
-
-                if (firstPlayableEventTime != std::numeric_limits<double>::max() && firstPlayableEventTime > 0.0)
-                {
-                    for (int i = 0; i < midiSequence.getNumEvents(); ++i)
-                    {
-                        if (auto* event = midiSequence.getEventPointer(i))
-                            event->message.setTimeStamp(juce::jmax(0.0, event->message.getTimeStamp() - firstPlayableEventTime));
-                    }
-                }
-
-                midiSequence.updateMatchedPairs();
-                juce::Logger::writeToLog("Loaded MIDI file for playback: " + midiFilePath
-                    + " (BPM: " + juce::String(configuredBpm, 2) + ")");
+                if (auto* event = midiSequence.getEventPointer(i))
+                    event->message.setTimeStamp(juce::jmax(0.0, event->message.getTimeStamp() - firstPlayableEventTime));
             }
         }
-        else
-        {
-            juce::Logger::writeToLog("Failed to read MIDI file: " + midiFilePath);
-        }
+
+        midiSequence.updateMatchedPairs();
+        hasLoadedMidiFileSequence = true;
+        juce::Logger::writeToLog("Loaded " + juce::String(loadedMidiFiles)
+            + " MIDI file slot(s) for playback (BPM: " + juce::String(configuredBpm, 2) + ").");
     }
-    // Initialize fallback MIDI timing (quarter notes at configured BPM)
+
+    midiCollector.reset(sampleRate);
+
     const double secondsPerBeat = 60.0 / configuredBpm;
     fallbackNoteLengthSamples = static_cast<int64_t>(secondsPerBeat * sampleRate);
     fallbackRestLengthSamples = static_cast<int64_t>(secondsPerBeat * sampleRate);
@@ -301,16 +599,41 @@ void HostApp::audioDeviceAboutToStart (juce::AudioIODevice* device)
     sinePhase = 0.0;
 }
 
+void HostApp::releasePlaybackState()
+{
+    for (auto& slot : audioInputSlots)
+    {
+        if (slot.transportSource != nullptr)
+        {
+            slot.transportSource->stop();
+            slot.transportSource->releaseResources();
+        }
+        slot.transportSource.reset();
+        slot.readerSource.reset();
+    }
+}
+
+void HostApp::audioDeviceAboutToStart (juce::AudioIODevice* device)
+{
+    if (pluginInstance == nullptr || device == nullptr)
+        return;
+
+    preparePlaybackState(device->getCurrentSampleRate(), device->getCurrentBufferSizeSamples());
+}
+
 void HostApp::audioDeviceStopped()
 {
     if (pluginInstance != nullptr)
         pluginInstance->releaseResources();
-        
-    if (audioTransportSource != nullptr)
-    {
-        audioTransportSource->stop();
-        audioTransportSource->releaseResources();
-    }
+
+    releasePlaybackState();
+}
+
+void HostApp::handleIncomingMidiMessage(juce::MidiInput* source,
+                                        const juce::MidiMessage& message)
+{
+    juce::ignoreUnused(source);
+    midiCollector.addMessageToQueue(message);
 }
 
 void HostApp::audioDeviceIOCallbackWithContext (const float* const* inputChannelData,
@@ -320,91 +643,150 @@ void HostApp::audioDeviceIOCallbackWithContext (const float* const* inputChannel
                                                 int numSamples,
                                                 const juce::AudioIODeviceCallbackContext& context)
 {
-    juce::ignoreUnused(inputChannelData, numInputChannels, context);
+    juce::ignoreUnused(context);
 
     if (pluginInstance == nullptr)
+    {
+        for (int i = 0; i < numOutputChannels; ++i)
+        {
+            if (outputChannelData[i] != nullptr)
+                juce::FloatVectorOperations::clear(outputChannelData[i], numSamples);
+        }
         return;
+    }
 
-    // Process audio inputs
-    internalBuffer.setSize(pluginInstance->getTotalNumInputChannels(), numSamples, false, false, true);
+    renderNextBlock(inputChannelData, numInputChannels, numSamples);
+
+    for (int i = 0; i < numOutputChannels; ++i)
+    {
+        if (outputChannelData[i] == nullptr)
+            continue;
+
+        if (i < internalBuffer.getNumChannels())
+            juce::FloatVectorOperations::copy(outputChannelData[i], internalBuffer.getReadPointer(i), numSamples);
+        else
+            juce::FloatVectorOperations::clear(outputChannelData[i], numSamples);
+    }
+}
+
+void HostApp::renderNextBlock(const float* const* inputChannelData,
+                              int numInputChannels,
+                              int numSamples)
+{
+    const auto processChannels = juce::jmax(pluginInstance->getTotalNumInputChannels(),
+                                            pluginInstance->getTotalNumOutputChannels());
+    internalBuffer.setSize(processChannels, numSamples, false, false, true);
     internalBuffer.clear();
     internalMidiBuffer.clear();
 
-    if (audioTransportSource != nullptr && audioTransportSource->isPlaying())
+    if (hasConfiguredAudioSlots)
     {
-        juce::AudioSourceChannelInfo info(&internalBuffer, 0, numSamples);
-        audioTransportSource->getNextAudioBlock(info);
-        
-        if (audioTransportSource->hasStreamFinished())
+        slotScratchBuffer.setSize(1, numSamples, false, false, true);
+
+        for (auto& slot : audioInputSlots)
         {
-            if (shouldLoop)
+            if (!juce::isPositiveAndBelow(slot.pluginInputChannel, internalBuffer.getNumChannels()))
+                continue;
+
+            if (slot.sourceType == AudioInputSlot::SourceType::File)
             {
-                audioTransportSource->setPosition(0.0);
-                audioTransportSource->start();
+                if (slot.transportSource != nullptr && slot.transportSource->isPlaying())
+                {
+                    slotScratchBuffer.clear();
+                    juce::AudioSourceChannelInfo info(&slotScratchBuffer, 0, numSamples);
+                    slot.transportSource->getNextAudioBlock(info);
+                    internalBuffer.copyFrom(slot.pluginInputChannel, 0, slotScratchBuffer, 0, 0, numSamples);
+
+                    if (slot.transportSource->hasStreamFinished())
+                    {
+                        if (shouldLoop)
+                        {
+                            slot.transportSource->setPosition(0.0);
+                            slot.transportSource->start();
+                        }
+                        else
+                        {
+                            slot.transportSource->stop();
+                        }
+                    }
+                }
             }
             else
             {
-                audioTransportSource->stop();
+                if (juce::isPositiveAndBelow(slot.deviceInputChannel, numInputChannels)
+                    && inputChannelData != nullptr
+                    && inputChannelData[slot.deviceInputChannel] != nullptr)
+                {
+                    juce::FloatVectorOperations::copy(internalBuffer.getWritePointer(slot.pluginInputChannel),
+                                                      inputChannelData[slot.deviceInputChannel],
+                                                      numSamples);
+                }
+                else if (!slot.warnedInvalidChannel)
+                {
+                    juce::Logger::writeToLog("audio_" + juce::String(slot.slotIndex)
+                        + " could not read input channel ID " + juce::String(slot.requestedDeviceId)
+                        + " from current audio device.");
+                    slot.warnedInvalidChannel = true;
+                }
             }
         }
     }
-    else if (audioFilePath.isEmpty())
+    else
     {
-        // Fallback: generate a 440Hz sine wave
-        const double sampleRate = pluginInstance->getSampleRate();
+        const double sampleRate = pluginInstance->getSampleRate() > 0.0 ? pluginInstance->getSampleRate() : 44100.0;
         const double phaseIncrement = juce::MathConstants<double>::twoPi * sineFrequency / sampleRate;
-        const int numChannels = internalBuffer.getNumChannels();
+        const int numChannels = juce::jmax(1, pluginInstance->getTotalNumInputChannels());
         for (int s = 0; s < numSamples; ++s)
         {
-            float sample = 0.5f * static_cast<float>(std::sin(sinePhase));
-            for (int ch = 0; ch < numChannels; ++ch)
+            const float sample = 0.5f * static_cast<float>(std::sin(sinePhase));
+            for (int ch = 0; ch < numChannels && ch < internalBuffer.getNumChannels(); ++ch)
                 internalBuffer.setSample(ch, s, sample);
+
             sinePhase += phaseIncrement;
             if (sinePhase >= juce::MathConstants<double>::twoPi)
                 sinePhase -= juce::MathConstants<double>::twoPi;
         }
     }
 
-    // Prepare MIDI events — file or fallback pattern
-    if (midiFilePath.isNotEmpty())
+    if (!activeMidiDeviceIdentifiers.isEmpty())
+        midiCollector.removeNextBlockOfMessages(internalMidiBuffer, numSamples);
+
+    if (hasLoadedMidiFileSequence)
     {
-        double timeNow  = playbackSamplePosition / pluginInstance->getSampleRate();
-        double nextTime  = timeNow + (numSamples / pluginInstance->getSampleRate());
+        const auto sampleRate = pluginInstance->getSampleRate() > 0.0 ? pluginInstance->getSampleRate() : 44100.0;
+        const double timeNow = playbackSamplePosition / sampleRate;
+        const double nextTime = timeNow + (numSamples / sampleRate);
 
         while (nextMidiEventIndex < midiSequence.getNumEvents())
         {
             auto* event = midiSequence.getEventPointer(nextMidiEventIndex);
-            double eventTime = event->message.getTimeStamp();
+            const double eventTime = event->message.getTimeStamp();
 
             if (eventTime >= timeNow && eventTime < nextTime)
             {
-                int samplePos = juce::jlimit(0, numSamples - 1, static_cast<int>((eventTime - timeNow) * pluginInstance->getSampleRate()));
+                const int samplePos = juce::jlimit(0, numSamples - 1, static_cast<int>((eventTime - timeNow) * sampleRate));
                 internalMidiBuffer.addEvent(event->message, samplePos);
-                nextMidiEventIndex++;
+                ++nextMidiEventIndex;
             }
             else if (eventTime >= nextTime)
             {
                 break;
             }
-            else 
+            else
             {
-                // we've passed it somehow or it's out of order
-                nextMidiEventIndex++;
+                ++nextMidiEventIndex;
             }
         }
 
-        if (nextMidiEventIndex >= midiSequence.getNumEvents())
+        if (nextMidiEventIndex >= midiSequence.getNumEvents() && shouldLoop)
         {
-            if (shouldLoop)
-            {
-                nextMidiEventIndex = 0;
-                playbackSamplePosition = 0;
-            }
+            nextMidiEventIndex = 0;
+            playbackSamplePosition = 0;
         }
     }
-    else
+    else if (!hasConfiguredMidiSlots)
     {
-        // Fallback MIDI: note-on -> hold -> note-off -> rest -> repeat
+        // Fallback MIDI: note-on -> hold -> note-off -> rest -> repeat.
         for (int s = 0; s < numSamples; ++s)
         {
             switch (fallbackMidiState)
@@ -438,22 +820,11 @@ void HostApp::audioDeviceIOCallbackWithContext (const float* const* inputChannel
         }
     }
 
-    // Advance playback position
-    playbackSamplePosition += numSamples;
-
-    // VST3 Process Block
+    const auto blockStartSample = playbackSamplePosition;
+    const auto sampleRate = pluginInstance->getSampleRate() > 0.0 ? pluginInstance->getSampleRate() : 44100.0;
+    hostTransportPlayHead.update(configuredBpm, sampleRate, blockStartSample, true, shouldLoop);
+    ScopedPluginPlayHead scopedPlayHead(*pluginInstance, hostTransportPlayHead);
     pluginInstance->processBlock(internalBuffer, internalMidiBuffer);
 
-    // Copy to output channels
-    for (int i = 0; i < numOutputChannels; ++i)
-    {
-        if (i < internalBuffer.getNumChannels())
-        {
-            juce::FloatVectorOperations::copy(outputChannelData[i], internalBuffer.getReadPointer(i), numSamples);
-        }
-        else
-        {
-            juce::FloatVectorOperations::clear(outputChannelData[i], numSamples);
-        }
-    }
+    playbackSamplePosition += numSamples;
 }
