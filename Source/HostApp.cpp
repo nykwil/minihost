@@ -99,8 +99,14 @@ bool HostApp::initialise(const juce::String& pluginPath,
         juce::Logger::writeToLog("BPM override applied from command line: " + juce::String(configuredBpm, 2));
     }
 
-    juce::Logger::writeToLog("Initializing default audio devices...");
-    auto err = deviceManager.initialiseWithDefaultDevices(2, 2);
+    // Only request live audio input channels if any slots are sourced from a device.
+    // File-backed slots don't need an input device open.
+    bool needsDeviceInput = std::any_of(audioInputSlots.begin(), audioInputSlots.end(),
+        [](const AudioInputSlot& s) { return s.sourceType == AudioInputSlot::SourceType::DeviceChannel; });
+    int numInputChannels = needsDeviceInput ? 2 : 0;
+
+    juce::Logger::writeToLog("Initializing audio devices (inputs: " + juce::String(numInputChannels) + ", outputs: 2)...");
+    auto err = deviceManager.initialiseWithDefaultDevices(numInputChannels, 2);
     juce::Logger::writeToLog("Audio devices initialized.");
     if (err.isNotEmpty())
     {
@@ -203,17 +209,32 @@ bool HostApp::runTest()
     juce::Logger::writeToLog("--- Starting Test Mode ---");
     logRoutingSummary();
 
+    // Drive processBlock directly with a self-contained local buffer.
+    // No audio device involvement, no shared state with the live callback —
+    // this is the original safe design that avoids any concurrency issues.
     const int numBlocksToProcess = 10;
     const int bufferSize = 512;
     const double sampleRate = 44100.0;
-    preparePlaybackState(sampleRate, bufferSize);
+
+    pluginInstance->prepareToPlay(sampleRate, bufferSize);
+
+    const int channels = juce::jmax(pluginInstance->getTotalNumInputChannels(),
+                                     pluginInstance->getTotalNumOutputChannels());
+    juce::AudioBuffer<float> buffer(juce::jmax(1, channels), bufferSize);
+    juce::MidiBuffer midiBuffer;
+
+    hostTransportPlayHead.update(configuredBpm, sampleRate, 0, true, false);
     ScopedPluginPlayHead scopedPlayHead(*pluginInstance, hostTransportPlayHead);
 
     for (int i = 0; i < numBlocksToProcess; ++i)
-        renderNextBlock(nullptr, 0, bufferSize);
+    {
+        buffer.clear();
+        hostTransportPlayHead.update(configuredBpm, sampleRate,
+                                     (int64_t)i * bufferSize, true, false);
+        pluginInstance->processBlock(buffer, midiBuffer);
+    }
 
     pluginInstance->releaseResources();
-    releasePlaybackState();
 
     juce::Logger::writeToLog("Processed " + juce::String(numBlocksToProcess) + " blocks successfully.");
     return true;
