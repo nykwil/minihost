@@ -32,5 +32,9 @@ minihost_config.json
 *.user
 *.suo
 
+# macOS metadata
+.DS_Store
+*.dSYM/
+
 # Claude Code local settings
 .claude/

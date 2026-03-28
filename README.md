@@ -16,62 +16,89 @@
 
 ## Requirements
 
-- Windows
 - CMake 3.22 or newer
-- A local JUCE checkout
+- A local [JUCE](https://github.com/juce-framework/JUCE) checkout
 - A C++20-capable compiler
-- A CMake generator such as Ninja or Visual Studio 2022
+- Ninja (recommended) or another CMake generator
+
+**Windows:** Visual Studio 2022 or newer (MSVC). Run from a Developer Command Prompt when using Ninja.
+
+**macOS:** Xcode command line tools (`xcode-select --install`).
+
+**Linux:** GCC or Clang, plus the following development packages:
+```sh
+# Debian / Ubuntu
+sudo apt install libasound2-dev libx11-dev libxrandr-dev libxinerama-dev \
+     libxcursor-dev libfreetype6-dev libfontconfig1-dev libgl1-mesa-dev
+```
 
 ## Building
 
-Set `JUCE_DIR` to your local JUCE checkout, then run the build script:
+Set `JUCE_DIR` to your local JUCE checkout, then run the build script.
 
+**Windows:**
 ```bat
-set JUCE_DIR=D:\path\to\JUCE
+set JUCE_DIR=C:\path\to\JUCE
 build.bat
 ```
 
-`build.bat` defaults to `Ninja`. When using `Ninja` with MSVC, run it from a Developer Command Prompt or another shell where `cl.exe` is already available. To use a different generator, set `CMAKE_GENERATOR` first:
+**macOS / Linux:**
+```sh
+export JUCE_DIR=/path/to/JUCE
+chmod +x build.sh
+./build.sh
+```
+
+`build.bat` / `build.sh` default to the `Ninja` generator. To use a different generator, set `CMAKE_GENERATOR` first:
 
 ```bat
 set CMAKE_GENERATOR=Visual Studio 17 2022
 build.bat
 ```
 
-If you run `Ninja` manually instead of using `build.bat`, do it from a Developer Command Prompt or another shell where the compiler environment is already configured.
-
 You can also configure and build manually:
 
-```bat
-cmake -S . -B build -G Ninja -DJUCE_DIR="D:/path/to/JUCE"
+```sh
+cmake -S . -B build -G Ninja -DJUCE_DIR="/path/to/JUCE"
 cmake --build build --config Debug
 ```
 
-The executable is written to:
+### Build output
 
-```text
-build\minihost_artefacts\Debug\minihost.exe
-```
+| Platform | Executable path |
+|----------|----------------|
+| Windows  | `build\minihost_artefacts\Debug\minihost.exe` |
+| macOS    | `build/minihost_artefacts/Debug/minihost.app/Contents/MacOS/minihost` |
+| Linux    | `build/minihost_artefacts/Debug/minihost` |
 
 ## Usage
 
 ```text
-minihost.exe [--test] [--config <path\to\minihost_config.json>] [--bpm <value>] <path\to\plugin.vst3>
+minihost [--test] [--config <path/to/minihost_config.json>] [--bpm <value>] <path/to/plugin.vst3>
 ```
 
-- `<path\to\plugin.vst3>`: required plugin path
-- `--test`: process 10 blocks and exit without opening a GUI
+- `<path/to/plugin.vst3>`: required plugin path
+- `--test`: process 10 blocks and exit without opening a GUI; exits 0 on success, 1 on failure
 - `--config <path>`: load config from a specific JSON file
 - `--bpm <value>`: override BPM from config; must be greater than `0`
 
-Examples:
-
+**Windows:**
 ```bat
 minihost.exe "C:\VST3\MyPlugin.vst3"
 minihost.exe --test "C:\VST3\MyPlugin.vst3"
 minihost.exe --config ".\minihost_config.json" "C:\VST3\MyPlugin.vst3"
 minihost.exe --bpm 100 "C:\VST3\MyPlugin.vst3"
 ```
+
+**macOS / Linux:**
+```sh
+./minihost /path/to/MyPlugin.vst3
+./minihost --test /path/to/MyPlugin.vst3
+./minihost --config ./minihost_config.json /path/to/MyPlugin.vst3
+./minihost --bpm 100 /path/to/MyPlugin.vst3
+```
+
+On macOS, VST3 plugins are typically found in `~/Library/Audio/Plug-Ins/VST3/` or `/Library/Audio/Plug-Ins/VST3/`.
 
 ## Configuration
 
@@ -81,11 +108,11 @@ Example:
 
 ```json
 {
-  "audio_1": "Samples\\input.wav",
+  "audio_1": "Samples/input.wav",
   "audio_2": 1,
-  "midi_1": "Samples\\sequence.mid",
+  "midi_1": "Samples/sequence.mid",
   "midi_2": 1,
-  "log_path": "logs\\minihost.log",
+  "log_path": "logs/minihost.log",
   "bpm": 120
 }
 ```
@@ -105,7 +132,7 @@ Legacy `audio_file` and `midi_file` keys are still accepted and map to slot `1` 
 
 - In `--test` mode, logs are written to `stdout` and `stderr`
 - If `log_path` is set, logs are also written to that file
-- In GUI mode, the host falls back to `Desktop\minihost.log` when `log_path` is not set
+- In GUI mode, the host falls back to `Desktop/minihost.log` when `log_path` is not set
 
 ## Project Structure
 
@@ -113,6 +140,7 @@ Legacy `audio_file` and `midi_file` keys are still accepted and map to slot `1` 
 minihost/
 ├── CMakeLists.txt
 ├── build.bat
+├── build.sh
 ├── minihost_config.example.json
 └── Source/
     ├── HostApp.cpp
