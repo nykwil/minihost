@@ -31,3 +31,6 @@ minihost_config.json
 .idea/
 *.user
 *.suo
+
+# Claude Code local settings
+.claude/
