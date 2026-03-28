@@ -13,7 +13,8 @@ public:
 
     bool initialise(const juce::String& pluginPath,
                     const juce::String& configPath = {},
-                    double bpmOverride = 0.0);
+                    double bpmOverride = 0.0,
+                    bool skipAudioDevice = false);
     void shutdown();
     
     // AudioIODeviceCallback methods

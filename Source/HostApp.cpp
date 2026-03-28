@@ -87,7 +87,8 @@ HostApp::~HostApp()
 
 bool HostApp::initialise(const juce::String& pluginPath,
                          const juce::String& configPath,
-                         double bpmOverride)
+                         double bpmOverride,
+                         bool skipAudioDevice)
 {
     juce::Logger::writeToLog("HostApp::initialise called.");
 
@@ -105,13 +106,16 @@ bool HostApp::initialise(const juce::String& pluginPath,
         [](const AudioInputSlot& s) { return s.sourceType == AudioInputSlot::SourceType::DeviceChannel; });
     int numInputChannels = needsDeviceInput ? 2 : 0;
 
-    juce::Logger::writeToLog("Initializing audio devices (inputs: " + juce::String(numInputChannels) + ", outputs: 2)...");
-    auto err = deviceManager.initialiseWithDefaultDevices(numInputChannels, 2);
-    juce::Logger::writeToLog("Audio devices initialized.");
-    if (err.isNotEmpty())
+    if (!skipAudioDevice)
     {
-        juce::Logger::writeToLog("Error initializing audio devices: " + err);
-        return false;
+        juce::Logger::writeToLog("Initializing audio devices (inputs: " + juce::String(numInputChannels) + ", outputs: 2)...");
+        auto err = deviceManager.initialiseWithDefaultDevices(numInputChannels, 2);
+        juce::Logger::writeToLog("Audio devices initialized.");
+        if (err.isNotEmpty())
+        {
+            juce::Logger::writeToLog("Error initializing audio devices: " + err);
+            return false;
+        }
     }
 
     juce::File pluginFile(pluginPath);
@@ -182,7 +186,9 @@ bool HostApp::initialise(const juce::String& pluginPath,
 
     logRoutingSummary();
 
-    deviceManager.addAudioCallback(this);
+    if (!skipAudioDevice)
+        deviceManager.addAudioCallback(this);
+
     return true;
 }
 

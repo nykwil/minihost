@@ -2,6 +2,10 @@
 #include <JuceHeader.h>
 #include "HostApp.h"
 
+#if JUCE_WINDOWS
+ #include <windows.h>
+#endif
+
 namespace
 {
 class CompositeLogger : public juce::Logger
@@ -114,6 +118,23 @@ public:
     {
         juce::ignoreUnused(commandLine);
 
+#if JUCE_WINDOWS
+        {
+            const auto earlyArgs = juce::JUCEApplication::getCommandLineParameterArray();
+            for (const auto& arg : earlyArgs)
+            {
+                if (arg == "--test")
+                {
+                    AttachConsole(ATTACH_PARENT_PROCESS);
+                    FILE* dummy;
+                    freopen_s(&dummy, "CONOUT$", "w", stdout);
+                    freopen_s(&dummy, "CONOUT$", "w", stderr);
+                    break;
+                }
+            }
+        }
+#endif
+
         auto args = juce::JUCEApplication::getCommandLineParameterArray();
         bool runTestingMode = false;
         juce::String pluginPath;
@@ -212,6 +233,7 @@ public:
         if (argumentError.isNotEmpty())
         {
             juce::Logger::writeToLog(argumentError);
+            juce::JUCEApplication::setApplicationReturnValue(1);
             juce::JUCEApplication::quit();
             return;
         }
@@ -225,9 +247,10 @@ public:
         hostApp = std::make_unique<HostApp>();
         juce::Logger::writeToLog("HostApp created. Abstracting audio/midi devices...");
         
-        if (!hostApp->initialise(pluginPath, configPath, bpmOverride))
+        if (!hostApp->initialise(pluginPath, configPath, bpmOverride, runTestingMode))
         {
             juce::Logger::writeToLog("Failed to initialize HostApp with plugin: " + pluginPath);
+            juce::JUCEApplication::setApplicationReturnValue(1);
             juce::JUCEApplication::quit();
             return;
         }
@@ -240,8 +263,11 @@ public:
             if (testSuccess)
                 juce::Logger::writeToLog("Testing completed successfully.");
             else
+            {
                 juce::Logger::writeToLog("Error during test mode.");
-            
+                juce::JUCEApplication::setApplicationReturnValue(1);
+            }
+
             juce::JUCEApplication::quit();
             return;
         }
